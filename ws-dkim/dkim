@@ -1,0 +1,100 @@
+#!/bin/bash
+
+RED=$(tput setaf 1)
+GREEN=$(tput setaf 2)
+BRIGHT=$(tput bold)
+NORMAL=$(tput sgr0)
+
+set -e
+. config
+
+usage() { printf "Usage: $0 [-hc] -d <string> [-id <number>] [-s <string>]\n" 1>&2; exit 1; }
+help() {
+  printf "Usage: $0 [-?hc] -d <string> [-i <number>] [-s <string>]\n"
+  printf "\n"
+  printf "Options:\n"
+  printf " -h\t\t: this help\n"
+  printf " -c\t\t: opens config file using editor command\n"
+  printf " -d domain\t: domain for which you want to modify your DKIM record without any subdomains\n"
+  printf " -i id\t\t: id of the record you want to modify\n"
+  printf " -s subdomain\t: subdomain for which you want to modify your DKIM record\n"
+  printf "\n"
+  exit 0
+}
+
+while getopts "hd:i:s:c" o; do
+    case "${o}" in
+        h)
+            help
+            ;;
+        c)
+            SCRIPTPATH=`pwd -P`
+            editor $SCRIPTPATH/config
+            exit 0
+            ;;
+        d)
+            d=${OPTARG}
+            ;;
+        i)
+            id=${OPTARG}
+            ;;
+        s)
+            s=${OPTARG}
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "${d}" ]; then
+    usage
+fi
+
+YYYY=$(date +'%Y')
+MM=$(date +'%m')
+
+if [ -z "${s}" ]; then
+  NAME="$YYYY$MM._domainkey"
+  DOMAIN="$d"
+else
+  NAME="$YYYY$MM._domainkey.$s"
+  DOMAIN="$s.$d"
+fi
+
+printf "Generating key for domain $DOMAIN: "
+
+sed -i "/$DOMAIN/d" /etc/opendkim/key.table
+echo "$DOMAIN  $DOMAIN:$YYYY$MM:/etc/opendkim/keys/$DOMAIN.private" >> /etc/opendkim/key.table
+
+opendkim-genkey -b 4096 -r -s "$YYYY$MM"
+mv "$YYYY$MM.private" "/etc/opendkim/keys/$DOMAIN.private"
+CONTENT=$(cat "$YYYY$MM.txt" | sed 's/.*( //' | sed 's/ ).*//' | sed 's/"//g' | tr -d '\n' | tr -d '\t' | tr -d ' ')
+
+printf "${GREEN}${BRIGHT}Done.${NORMAL}\n"
+
+if [ -z "${id}" ]; then
+  printf "Creating new TXT record: "
+  RESPONSE=$(curl -s "https://rest.websupport.sk/v1/user/self/zone/$d/record" -H "Content-Type: application/json" -X POST -d "{\"type\":\"TXT\", \"name\":\"$NAME\",\"content\": \"$CONTENT\",\"ttl\": 600}" -u $USER:$PASS)
+else
+  printf "Updating selected TXT record: "
+  RESPONSE=$(curl -s "https://rest.websupport.sk/v1/user/self/zone/$d/record/$id" -H "Content-Type: application/json" -X PUT -d "{\"name\":\"$NAME\",\"content\": \"$CONTENT\",\"ttl\": 600}" -u $USER:$PASS)
+fi
+STATUS=$(echo "$RESPONSE" | jq .status)
+if [ "$STATUS" != '"success"' ]; then
+  printf "${RED}${BRIGHT}error${NORMAL}\n"
+  echo $RESPONSE | jq .
+  exit 1
+fi
+printf "${GREEN}${BRIGHT}Done.${NORMAL}\n"
+
+rm "$YYYY$MM.txt"
+
+printf "Modifying permissions and restaring opendkim: "
+
+chown -R opendkim:opendkim /etc/opendkim
+chmod -R go-rw /etc/opendkim/keys
+service opendkim restart
+
+printf "${GREEN}${BRIGHT}Done.${NORMAL}\n"
